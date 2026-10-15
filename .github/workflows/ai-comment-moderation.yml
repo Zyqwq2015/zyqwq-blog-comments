@@ -1,0 +1,85 @@
+name: AI moderation for GitHub Discussions comments
+
+on:
+  discussion_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  discussions: write
+
+concurrency:
+  group: ai-moderation-${{ github.event.comment.node_id }}
+  cancel-in-progress: false
+
+jobs:
+  moderate:
+    if: github.repository == 'Zyqwq2015/zyqwq-blog-comments'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Classify and remove unsafe or unreviewable comments
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODERATION_SECRET: ${{ secrets.COMMENT_MODERATION_SECRET }}
+          MODERATION_URL: https://www.zyqwq.cn/api/internal/comment-moderation
+          COMMENT_NODE_ID: ${{ github.event.comment.node_id }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          node <<'NODE'
+          const body = process.env.COMMENT_BODY || '';
+          const nodeId = process.env.COMMENT_NODE_ID || '';
+          const moderationSecret = process.env.MODERATION_SECRET || '';
+          const githubToken = process.env.GH_TOKEN || '';
+
+          async function main() {
+            let decision = 'service_unavailable';
+            try {
+              if (!moderationSecret) throw new Error('moderation secret is missing');
+              const r = await fetch(process.env.MODERATION_URL, {
+                method: 'POST',
+                headers: {
+                  'authorization': 'Bearer ' + moderationSecret,
+                  'content-type': 'application/json',
+                },
+                body: JSON.stringify({ content: body }),
+                signal: AbortSignal.timeout(25000),
+              });
+              const result = await r.json().catch(() => ({}));
+              if (r.ok && result && typeof result.decision === 'string') decision = result.decision;
+            } catch {
+              // Fail closed: leave no unchecked comment public if AI is unavailable.
+            }
+
+            if (decision === 'allow') {
+              console.log('Comment passed automated safety classification.');
+              return;
+            }
+
+            if (!nodeId || !githubToken) throw new Error('Cannot remove unreviewed comment: missing GitHub ID/token.');
+            const deleted = await fetch('https://api.github.com/graphql', {
+              method: 'POST',
+              headers: {
+                'authorization': 'Bearer ' + githubToken,
+                'content-type': 'application/json',
+                'user-agent': 'zyqwq-comment-moderation',
+                'x-github-api-version': '2022-11-28',
+              },
+              body: JSON.stringify({
+                query: 'mutation($id: ID!) { deleteDiscussionComment(input: {id: $id}) { comment { id } } }',
+                variables: { id: nodeId },
+              }),
+              signal: AbortSignal.timeout(20000),
+            });
+            const out = await deleted.json().catch(() => ({}));
+            if (!deleted.ok || out.errors?.length || !out.data?.deleteDiscussionComment?.comment?.id) {
+              throw new Error('GitHub could not remove the unreviewed comment; check workflow permissions.');
+            }
+            console.log('Comment removed by moderation policy. Decision: ' + decision + '.');
+          }
+
+          main().catch((error) => {
+            console.error(error.message || 'Moderation workflow failed.');
+            process.exitCode = 1;
+          });
+          NODE
