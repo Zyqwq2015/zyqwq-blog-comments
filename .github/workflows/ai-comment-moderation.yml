@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   moderate:
-    if: github.repository == 'Zyqwq2015/zyqwq-blog-comments'
+    if: github.repository == 'Zyqwq2015/zyqwq-blog-comments' && github.event.comment.user.login != 'Zyqwq2015'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
